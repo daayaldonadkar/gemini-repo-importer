@@ -1,0 +1,71 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Repo Importer",
+  "version": "0.1.0",
+  "description": "Import GitHub repositories into Gemini's 'Import Code' feature via keyboard shortcuts.",
+
+  "//permissions-note": "These are the capabilities the extension is allowed to use. We request them up front so the browser shows the user one clean permission prompt on install. None are used for real work yet.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+
+  "//host-permissions-note": "Restricts the extension's site access to ONLY Gemini. The content script will only load here, and any future message/script injection is scoped to this origin.",
+  "host_permissions": [
+    "https://gemini.google.com/*"
+  ],
+
+  "//icons-note": "Icons shown in the toolbar, extensions page, and install dialog. Sized for the contexts Chrome uses (16 = toolbar, 48 = extensions page, 128 = store/install).",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "//action-note": "The toolbar button. Clicking it opens popup.html. default_title is the tooltip; default_icon is the toolbar glyph.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Gemini Repo Importer",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "//background-note": "The invisible service worker (Manifest V3's replacement for background pages). It is the ONLY component that can receive keyboard command events, so command handling must start here.",
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "//content-scripts-note": "Auto-injected into matching pages. Because we match ONLY gemini.google.com, this script (which will drive the Import Code UI) never runs anywhere else.",
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+
+  "//commands-note": "Global keyboard shortcuts. Each command name below becomes a key we listen for in background.js. Chrome requires shortcuts to include Ctrl or Alt; Alt+Shift+<digit> satisfies that.",
+  "commands": {
+    "repo1": {
+      "suggested_key": {
+        "default": "Alt+Shift+1"
+      },
+      "description": "Import repository #1 into Gemini Import Code"
+    },
+    "repo2": {
+      "suggested_key": {
+        "default": "Alt+Shift+2"
+      },
+      "description": "Import repository #2 into Gemini Import Code"
+    },
+    "repo3": {
+      "suggested_key": {
+        "default": "Alt+Shift+3"
+      },
+      "description": "Import repository #3 into Gemini Import Code"
+    }
+  }
+}
