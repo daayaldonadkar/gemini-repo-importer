@@ -57,6 +57,23 @@ const IMPORT_CODE_FALLBACK_INDEX = 2; // 0-based -> the 3rd menu item, if text m
 const OVERLAY_WAIT_MS = 3000; // wait up to 3s for the submenu to render
 const OVERLAY_POLL_MS = 100; // re-check every 100ms (dynamic render)
 
+// Candidate selector for items inside the submenu. Intentionally BROAD: Gemini
+// may render each option as a role="menuitem", a <button>, a .mat-menu-item, or
+// a link. We collect all of these, then de-dupe (see getMenuCandidates). Do NOT
+// narrow this to role="menuitem" alone — that was the previous bug.
+const MENU_ITEM_SELECTOR =
+  '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], button, a, .mat-menu-item';
+
+// How many times to retry the Import-code lookup after the submenu appears
+// (items can render a moment after the pane), and the pause between retries.
+const IMPORT_CODE_ATTEMPTS = 5;
+const IMPORT_CODE_RETRY_MS = 150;
+
+// Pause after a menu opens, before clicking inside it. Angular menus animate
+// open (~200ms); clicking an item mid-animation can be swallowed — which was the
+// "need to press the shortcut twice" symptom. Bump this if menus animate slower.
+const MENU_SETTLE_MS = 250;
+
 // ---------------------------------------------------------------------------
 // 1. MESSAGE HANDLER — entry point; reacts to the background script.
 // ---------------------------------------------------------------------------
@@ -134,10 +151,14 @@ async function handleRepoSelected(repoNumber, repoUrl) {
   }
   console.log("Upload and tools button found");
 
-  // Open the uploads menu. A native .click() dispatches a real click event that
-  // bubbles to Gemini's React handlers; nothing fancier is needed here.
-  uploadButton.click();
+  // Open the uploads menu. We use the full pointer-event sequence (see
+  // clickMenuItem) because Angular menu triggers often open on mousedown, which
+  // a bare .click() never fires.
+  clickMenuItem(uploadButton);
   console.log("Upload menu opened");
+  // Let the uploads menu's open animation settle before we click inside it,
+  // otherwise the "More uploads" click can land too early and be swallowed.
+  await sleep(MENU_SETTLE_MS);
 
   // --- STEP 2: wait for the menu to render, then click "More uploads". ---
   console.log("Waiting for More uploads");
@@ -264,7 +285,7 @@ async function clickMoreUploads() {
   }
 
   console.log("More uploads button found");
-  button.click();
+  clickMenuItem(button);
   console.log("More uploads clicked");
   return true;
 }
@@ -340,35 +361,90 @@ async function waitFor(predicate, timeout, interval) {
 }
 
 /**
- * Wait for the Angular CDK overlay submenu to appear after "More uploads" is
- * clicked.
+ * True when an element is actually painted on screen (worth clicking), as
+ * opposed to merely present in the DOM. Menus sometimes keep hidden duplicates
+ * in the DOM, so we filter on visibility before counting or picking items.
  *
- * Angular CDK renders pop-up menus into a `.cdk-overlay-pane` (inside a
- * `cdk-overlay-container` appended to <body>) and gives the menu role="menu"
- * with role="menuitem" children. We wait until such a pane exists AND contains
- * at least one menuitem — proof the submenu has actually rendered its items, not
- * just an empty shell. (There may be more than one pane if the parent menu is
- * still open; any pane with menuitems is good enough to proceed.)
+ * @param {Element|null} el
+ * @returns {boolean}
+ */
+function isVisible(el) {
+  if (!el || el.nodeType !== Node.ELEMENT_NODE) {
+    return false;
+  }
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) {
+    return false;
+  }
+  let style = null;
+  try {
+    style = window.getComputedStyle(el);
+  } catch (e) {
+    style = null;
+  }
+  if (style) {
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse"
+    ) {
+      return false;
+    }
+    if (parseFloat(style.opacity) === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Collect candidate menu items within `scope` as a clean list: matched by the
+ * broad MENU_ITEM_SELECTOR, visible, and de-duplicated so a nested pair (e.g.
+ * <li role="menuitem"><button>) counts ONCE (we keep the outermost).
  *
- * Returns the overlay pane (or a role="menu" fallback), or null on timeout.
+ * `scope` may be null/omitted to search the whole document.
+ *
+ * @param {Element|null} scope
+ * @returns {Element[]}
+ */
+function getMenuCandidates(scope) {
+  const root = scope || document;
+  const visible = [...root.querySelectorAll(MENU_ITEM_SELECTOR)].filter(isVisible);
+  // Keep only candidates NOT contained inside another candidate (the outermost),
+  // so each visual row counts exactly once.
+  return visible.filter(
+    (el) => !visible.some((other) => other !== el && other.contains(el))
+  );
+}
+
+/**
+ * Wait for the submenu (opened by "More uploads") to appear and render at least
+ * one item.
+ *
+ * The submenu is an Angular CDK overlay pane (`.cdk-overlay-pane`) or a
+ * role="menu". We wait for the NEWEST visible one that already contains at least
+ * one candidate item (broad selector — NOT just role="menuitem", since Gemini's
+ * items may be plain buttons). Submenus append after their parent menu, so
+ * "newest" reliably targets the one we just opened.
+ *
+ * Returns the submenu element, or null on timeout (callers must still attempt
+ * the lookups regardless — a null here is not fatal).
  *
  * @returns {Promise<Element|null>}
  */
-async function waitForOverlayMenu() {
+async function waitForSubmenu() {
   return waitFor(
     () => {
-      // Preferred: an overlay pane that already has rendered menu items.
-      const panes = document.querySelectorAll(".cdk-overlay-pane");
-      for (const pane of panes) {
-        if (pane.querySelector('[role="menuitem"]')) {
-          return pane;
+      const panes = [...document.querySelectorAll(".cdk-overlay-pane")];
+      for (let i = panes.length - 1; i >= 0; i--) {
+        if (isVisible(panes[i]) && getMenuCandidates(panes[i]).length > 0) {
+          return panes[i];
         }
       }
-      // Fallback: any element with role="menu" that has menu items.
-      const menus = document.querySelectorAll('[role="menu"]');
-      for (const menu of menus) {
-        if (menu.querySelector('[role="menuitem"]')) {
-          return menu;
+      const menus = [...document.querySelectorAll('[role="menu"]')];
+      for (let i = menus.length - 1; i >= 0; i--) {
+        if (isVisible(menus[i]) && getMenuCandidates(menus[i]).length > 0) {
+          return menus[i];
         }
       }
       return null;
@@ -379,105 +455,169 @@ async function waitForOverlayMenu() {
 }
 
 /**
- * Locate the "Import code" menu item inside the open overlay submenu, by text.
+ * Locate the "Import code" item inside the submenu, by label text.
  *
- * We prefer semantic menu items / buttons / links (their textContent is just the
- * label, so a substring match is reliable); only as a last resort do we scan
- * generic LEAF elements (div/span with no children) so a wrapper that merely
- * *contains* the label can't be clicked by mistake. The match is
- * case-insensitive ("import code", "Import Code", etc. all hit).
+ * Searches the candidate items (semantic, visible, de-duplicated) within `scope`
+ * first; if nothing matches there, falls back to the whole document — the label
+ * is specific enough that a document-wide match is safe even if the submenu pane
+ * can't be identified.
  *
+ * Whitespace is normalized before matching, so a label split across spans
+ * ("Import" + "code") still hits. Case-insensitive.
+ *
+ * @param {Element|null} scope - submenu element, or null for the whole document.
  * @returns {Element|null}
  */
-function findImportCodeItem() {
-  const needle = IMPORT_CODE_TEXT.toLowerCase();
-  const semantic = document.querySelectorAll(
-    '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], button, a'
-  );
-  for (const el of semantic) {
-    if (el.textContent && el.textContent.trim().toLowerCase().includes(needle)) {
-      return el;
+function findImportCodeItem(scope) {
+  const needle = IMPORT_CODE_TEXT.toLowerCase().replace(/\s+/g, " ");
+  const matchIn = (candidates) => {
+    for (const el of candidates) {
+      const text = (el.textContent || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+      if (text.includes(needle)) {
+        return el;
+      }
     }
-  }
-  // Last resort: a leaf element (no children) bearing the label text.
-  for (const el of document.querySelectorAll("div, span")) {
-    if (
-      el.children.length === 0 &&
-      el.textContent &&
-      el.textContent.trim().toLowerCase().includes(needle)
-    ) {
-      return el;
-    }
-  }
-  return null;
+    return null;
+  };
+  // Submenu scope first, then the whole document as a safety net.
+  return matchIn(getMenuCandidates(scope)) || matchIn(getMenuCandidates(null));
 }
 
 /**
- * Fallback click target: the Nth (0-based IMPORT_CODE_FALLBACK_INDEX) menu item
- * in the most-recently-opened overlay pane. Submenus are appended AFTER their
- * parent menu, so the last pane-with-items is the submenu we just opened. Used
- * when the text lookup fails (e.g. a localized or renamed label).
+ * Positional fallback: the Nth candidate item (0-based IMPORT_CODE_FALLBACK_INDEX)
+ * inside the submenu `scope`. Per the known layout, "Import code" is the 3rd
+ * item from the top (and 2nd from the bottom), i.e. index 2.
  *
- * Falls back to the Nth menuitem anywhere in the document if no overlay pane has
- * enough items.
+ * Scoped to the submenu only — a document-wide positional pick is unreliable
+ * when the parent menu is also open (its items would shift the index). Returns
+ * null if there's no usable scope or too few items, so the caller can retry /
+ * rely on the text lookup instead.
  *
+ * @param {Element|null} scope
  * @returns {Element|null}
  */
-function nthMenuItemFallback() {
-  const panes = [...document.querySelectorAll(".cdk-overlay-pane")];
-  for (let i = panes.length - 1; i >= 0; i--) {
-    const items = panes[i].querySelectorAll('[role="menuitem"]');
-    if (items.length > IMPORT_CODE_FALLBACK_INDEX) {
-      return items[IMPORT_CODE_FALLBACK_INDEX];
+function nthMenuItemFallback(scope) {
+  if (!scope) {
+    return null;
+  }
+  const items = getMenuCandidates(scope);
+  return items.length > IMPORT_CODE_FALLBACK_INDEX
+    ? items[IMPORT_CODE_FALLBACK_INDEX]
+    : null;
+}
+
+/**
+ * Scroll an element into view and "click" it with the FULL pointer-event
+ * sequence: mouseover -> mousedown -> mouseup -> click.
+ *
+ * WHY NOT a bare .click(): a native .click() fires only the "click" event, but
+ * Angular menu triggers ([matMenuTriggerFor]) commonly OPEN on "mousedown". A
+ * bare click can therefore be silently ignored and the menu never opens — which
+ * was the "press the shortcut twice" symptom. Dispatching the whole sequence
+ * mimics a real tap and trips handlers bound to any of these events.
+ *
+ * Events bubble and are composed:true so they propagate like a real interaction
+ * and cross any shadow-DOM boundary Gemini may use.
+ *
+ * @param {Element} el
+ */
+function clickMenuItem(el) {
+  if (!el) {
+    return;
+  }
+  if (el.scrollIntoView) {
+    try {
+      el.scrollIntoView({ block: "center" });
+    } catch (e) {
+      /* best-effort scroll */
     }
   }
-  const all = document.querySelectorAll('[role="menuitem"]');
-  return all[IMPORT_CODE_FALLBACK_INDEX] || null;
+
+  const opts = { bubbles: true, cancelable: true, view: window, composed: true };
+  const fire = (type) => {
+    try {
+      el.dispatchEvent(new MouseEvent(type, opts));
+    } catch (e) {
+      // Fallback for engines without the MouseEvent constructor.
+      try {
+        const ev = document.createEvent("MouseEvents");
+        ev.initMouseEvent(
+          type,
+          opts.bubbles,
+          opts.cancelable,
+          window,
+          0, // detail
+          0, 0, 0, 0, // screenX/Y, clientX/Y
+          false, false, false, false, // ctrl/alt/shift/meta
+          0, // button
+          null // relatedTarget
+        );
+        el.dispatchEvent(ev);
+      } catch (e2) {
+        /* give up on this event type silently */
+      }
+    }
+  };
+
+  // hover -> press -> release -> click: the exact sequence a real tap produces.
+  fire("mouseover");
+  fire("mousedown");
+  fire("mouseup");
+  fire("click");
 }
 
 /**
  * STEP 3 — after "More uploads" opens the submenu, click the "Import code" item.
  *
- * Flow: wait for the Angular CDK overlay to render, then locate "Import code" by
- * text and click it. If the text lookup fails (e.g. the label is localized or
- * changed), fall back to clicking the 3rd menu item in the submenu.
+ * Strategy, in priority order:
+ *   1. Match the "Import code" label by text (most reliable; searches the
+ *      submenu, then the whole document as a safety net).
+ *   2. Fall back to the 3rd item by position (the known slot for Import code),
+ *      scoped to the submenu.
+ *
+ * We wait for the submenu to render, then RETRY the lookups a few times — items
+ * can appear a moment after the pane, and the submenu pane may not be detectable
+ * at all (in which case the text lookup still works document-wide). A failure to
+ * detect the overlay is NOT fatal: we always attempt the lookups.
  *
  * @returns {Promise<boolean>} true if an item was clicked, false otherwise.
  */
 async function clickImportCode() {
-  // (a) Wait for the overlay submenu to render its items.
-  const menu = await waitForOverlayMenu();
-  if (!menu) {
-    console.log("[Gemini Repo Importer] Import code menu (overlay) not found");
-    showToast("Import code menu not found");
-    return false;
+  console.log("Waiting for Import code menu");
+  const submenu = await waitForSubmenu(); // best-effort; null is OK
+  if (submenu) {
+    // Let the submenu's open animation settle before clicking inside it.
+    await sleep(MENU_SETTLE_MS);
   }
 
-  // (b) Find the "Import code" item by text.
-  const item = findImportCodeItem();
-  if (item) {
-    console.log("Import code item found");
-    // Bring it on-screen before clicking (some overlays render off-viewport).
-    if (item.scrollIntoView) {
-      item.scrollIntoView({ block: "center" });
+  for (let attempt = 1; attempt <= IMPORT_CODE_ATTEMPTS; attempt++) {
+    // (1) Text match — the primary path.
+    const byText = findImportCodeItem(submenu);
+    if (byText) {
+      console.log("Import code item found");
+      clickMenuItem(byText);
+      console.log("Import code clicked");
+      return true;
     }
-    item.click();
-    console.log("Import code clicked");
-    return true;
-  }
 
-  // (c) Text lookup failed — fall back to the 3rd menu item.
-  console.log(
-    "[Gemini Repo Importer] 'Import code' text not found — using 3rd-item fallback"
-  );
-  const fallback = nthMenuItemFallback();
-  if (fallback) {
-    if (fallback.scrollIntoView) {
-      fallback.scrollIntoView({ block: "center" });
+    // (2) Positional fallback — Import code is the 3rd item from the top.
+    const byPos = nthMenuItemFallback(submenu);
+    if (byPos) {
+      console.log(
+        "[Gemini Repo Importer] 'Import code' text not found — clicking 3rd item (fallback)"
+      );
+      clickMenuItem(byPos);
+      console.log("Import code clicked (fallback: 3rd item)");
+      return true;
     }
-    fallback.click();
-    console.log("Import code clicked (fallback)");
-    return true;
+
+    // Not ready yet — pause and retry.
+    if (attempt < IMPORT_CODE_ATTEMPTS) {
+      await sleep(IMPORT_CODE_RETRY_MS);
+    }
   }
 
   console.log("[Gemini Repo Importer] Import code item not found");
